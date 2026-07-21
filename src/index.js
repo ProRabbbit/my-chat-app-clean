@@ -74,7 +74,7 @@ export class ChatRoom {
         socket.send(JSON.stringify(messageData));
       }
 
-      // 2. タブを閉じている人を含め、登録されている全端末へWeb Push通知を送信
+      /// 2. タブを閉じている人を含め、登録されている全端末へWeb Push通知を送信
       const { results: subs } = await this.env.DB.prepare("SELECT * FROM push_subscriptions").all();
       const payload = JSON.stringify({
         title: `${messageData.name} さんからのメッセージ`,
@@ -89,10 +89,13 @@ export class ChatRoom {
             auth: sub.auth
           }
         };
-        // バックグラウンド通知の送信（失敗した古い購読は無視）
-        webpush.sendNotification(pushSubscription, payload).catch(err => {
-          console.error("Push notification error:", err);
-        });
+        
+        // ★ エラーの詳細をしっかりコンソールに出すように書き換え
+        try {
+          await webpush.sendNotification(pushSubscription, payload);
+        } catch (err) {
+          console.error("Push notification error detail:", err.statusCode, err.body || err.message);
+        }
       }
     });
 
