@@ -255,6 +255,14 @@ const htmlContent = `<!DOCTYPE html>
             document.getElementById("my-name").innerText = "名前: " + myName;
             nameModal.style.display = "none";
 
+            // ★ ここで明示的にブラウザに通知の許可を求めるポップアップを出させる
+            if ("Notification" in window) {
+                const permission = await Notification.requestPermission();
+                if (permission !== "granted") {
+                    alert("通知が許可されなかったため、バックグラウンド通知は届きません。");
+                }
+            }
+
             // Service Worker の登録とプッシュ通知の購読設定
             if ('serviceWorker' in navigator && 'PushManager' in window) {
                 try {
