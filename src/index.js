@@ -3,18 +3,28 @@ import { Hono } from 'hono';
 const app = new Hono();
 
 // --- バックエンド (Durable Object) ---
-// 変更なし
 export class ChatRoom {
   constructor(state, env) {
     this.state = state;
+    this.env = env;
     this.sessions = new Set();
-    // ストレージの自動初期化（エラー対策）
     this.state.blockConcurrencyWhile(async () => {
       await this.state.storage.get("dummy");
     });
   }
 
   async fetch(request) {
+    const url = new URL(request.url);
+
+    // 過去の履歴を返すAPI
+    if (url.pathname === "/api/history") {
+      const { results } = await this.env.DB.prepare(
+        "SELECT * FROM messages ORDER BY id DESC LIMIT 50"
+      ).all();
+      // 古い順に並べ替えて返す
+      return Response.json(results.reverse());
+    }
+
     const upgradeHeader = request.headers.get("Upgrade");
     if (upgradeHeader !== "websocket") {
       return new Response("Expected websocket", { status: 400 });
@@ -27,11 +37,23 @@ export class ChatRoom {
   handleSession(websocket) {
     websocket.accept();
     this.sessions.add(websocket);
+    
     websocket.addEventListener("message", async (event) => {
+      const data = JSON.parse(event.data);
+      const time = new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
+      const messageData = { name: data.name, text: data.text, time: time };
+
+      // データベースにメッセージを保存
+      await this.env.DB.prepare(
+        "INSERT INTO messages (name, text, time) VALUES (?, ?, ?)"
+      ).bind(messageData.name, messageData.text, messageData.time).run();
+
+      // 接続中の全員にブロードキャスト
       for (const socket of this.sessions) {
-        socket.send(event.data);
+        socket.send(JSON.stringify(messageData));
       }
     });
+
     websocket.addEventListener("close", () => {
       this.sessions.delete(websocket);
     });
@@ -39,7 +61,6 @@ export class ChatRoom {
 }
 
 // --- フロントエンド (HTML/CSS) ---
-// デザインを現代風に刷新しました
 const htmlContent = `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -48,26 +69,22 @@ const htmlContent = `<!DOCTYPE html>
     <title>Chat App Lite | Cloudflare</title>
     <style>
         :root {
-            --primary-color: #3b82f6; /* 青色 */
-            --bg-color: #f3f4f6; /* 薄いグレー */
+            --primary-color: #3b82f6;
+            --bg-color: #f3f4f6;
             --chat-bg: #ffffff;
             --text-color: #1f2937;
             --my-message-bg: #dbeafe;
             --header-height: 60px;
         }
-
         * { box-sizing: border-box; margin: 0; padding: 0; }
-
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             background-color: var(--bg-color);
             height: 100vh;
             display: flex;
-            flex-direction: direction;
+            flex-direction: column;
             color: var(--text-color);
         }
-
-        /* ヘッダー */
         header {
             background: var(--chat-bg);
             color: var(--primary-color);
@@ -84,43 +101,20 @@ const htmlContent = `<!DOCTYPE html>
             width: 100%;
             z-index: 100;
         }
-
-        header span {
-            font-size: 0.875rem;
-            color: #6b7280;
-            font-weight: normal;
-        }
-
-        /* チャットエリア */
+        header span { font-size: 0.875rem; color: #6b7280; font-weight: normal; }
         #chat-container {
             flex: 1;
             margin-top: var(--header-height);
-            margin-bottom: 80px; /* 入力エリアのスペース */
+            margin-bottom: 80px;
             overflow-y: auto;
             padding: 1rem;
             display: flex;
             flex-direction: column;
             gap: 10px;
         }
-
-        .message {
-            max-width: 80%;
-            display: flex;
-            flex-direction: column;
-            align-items: flex-start;
-        }
-
-        .message.mine {
-            align-self: flex-end;
-            align-items: flex-end;
-        }
-
-        .message-info {
-            font-size: 0.75rem;
-            color: #6b7280;
-            margin-bottom: 2px;
-        }
-
+        .message { max-width: 80%; display: flex; flex-direction: column; align-items: flex-start; }
+        .message.mine { align-self: flex-end; align-items: flex-end; }
+        .message-info { font-size: 0.75rem; color: #6b7280; margin-bottom: 2px; }
         .message-bubble {
             background: var(--chat-bg);
             padding: 0.75rem 1rem;
@@ -129,14 +123,11 @@ const htmlContent = `<!DOCTYPE html>
             box-shadow: 0 1px 2px rgba(0,0,0,0.05);
             word-wrap: break-word;
         }
-
         .message.mine .message-bubble {
             background: var(--my-message-bg);
             border-top-left-radius: 1rem;
             border-top-right-radius: 0;
         }
-
-        /* 入力エリア */
         #input-area {
             background: var(--chat-bg);
             padding: 1rem;
@@ -147,73 +138,51 @@ const htmlContent = `<!DOCTYPE html>
             bottom: 0;
             width: 100%;
         }
-
         input[type="text"] {
-            flex: 1;
-            padding: 0.75rem;
-            border: 1px solid #d1d5db;
-            border-radius: 0.5rem;
-            outline: none;
-            font-size: 1rem;
+            flex: 1; padding: 0.75rem; border: 1px solid #d1d5db; border-radius: 0.5rem; outline: none; font-size: 1rem;
         }
-
-        input[type="text"]:focus {
-            border-color: var(--primary-color);
-        }
-
+        input[type="text"]:focus { border-color: var(--primary-color); }
         button {
-            background-color: var(--primary-color);
-            color: white;
-            border: none;
-            padding: 0 1.5rem;
-            border-radius: 0.5rem;
-            font-weight: bold;
-            cursor: pointer;
-            font-size: 1rem;
-            transition: background-color 0.2s;
+            background-color: var(--primary-color); color: white; border: none; padding: 0 1.5rem; border-radius: 0.5rem; font-weight: bold; cursor: pointer; font-size: 1rem;
         }
-
-        button:hover {
-            background-color: #2563eb;
-        }
-
-        /* スクロールバーの調整 */
+        button:hover { background-color: #2563eb; }
         #chat-container::-webkit-scrollbar { width: 6px; }
         #chat-container::-webkit-scrollbar-thumb { background-color: #cbd5e1; border-radius: 3px; }
     </style>
 </head>
 <body>
-
     <header>
         Chat App Lite
         <span id="my-name"></span>
     </header>
-
-    <div id="chat-container">
-        <!-- メッセージがここに挿入されます -->
-    </div>
-
+    <div id="chat-container"></div>
     <div id="input-area">
         <input type="text" id="message-input" placeholder="メッセージを入力..." autocomplete="off">
         <button onclick="sendMessage()">送信</button>
     </div>
 
     <script>
-        // 名前の自動生成
         const randomName = "ゲスト" + Math.floor(Math.random() * 9000 + 1000);
         document.getElementById("my-name").innerText = "あなたの名前: " + randomName;
-
-        // WebSocket接続
-        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const ws = new WebSocket(\`\${protocol}//\${window.location.host}/api/room/default-room\`);
 
         const chatContainer = document.getElementById("chat-container");
         const input = document.getElementById("message-input");
 
-        // エンターキーでも送信できるようにする
-        input.addEventListener("keypress", function (e) {
-            if (e.key === 'Enter') sendMessage();
-        });
+        // 1. ページを開いたときに過去の履歴を読み込む
+        async function loadHistory() {
+            try {
+                const res = await fetch('/api/history');
+                const history = await res.json();
+                history.forEach(data => appendMessage(data));
+            } catch (e) {
+                console.error("履歴の取得に失敗しました", e);
+            }
+        }
+        loadHistory();
+
+        // 2. WebSocketの接続
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const ws = new WebSocket(\`\${protocol}//\${window.location.host}/api/room/default-room\`);
 
         ws.onmessage = (event) => {
             const data = JSON.parse(event.data);
@@ -225,17 +194,13 @@ const htmlContent = `<!DOCTYPE html>
             const div = document.createElement("div");
             div.className = \`message \${isMine ? 'mine' : ''}\`;
 
-            const time = new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
-
             div.innerHTML = \`
                 <div class="message-info">
-                    <span class="name">\${escapeHtml(data.name)}</span> ・ \${time}
+                    <span class="name">\${escapeHtml(data.name)}</span> ・ \${data.time || ''}
                 </div>
                 <div class="message-bubble">\${escapeHtml(data.text)}</div>
             \`;
-
             chatContainer.appendChild(div);
-            // 自動で一番下までスクロール
             chatContainer.scrollTop = chatContainer.scrollHeight;
         }
 
@@ -249,8 +214,12 @@ const htmlContent = `<!DOCTYPE html>
             };
             ws.send(JSON.stringify(payload));
             input.value = "";
-            input.focus(); // 入力欄にフォーカスを戻す
+            input.focus();
         }
+
+        input.addEventListener("keypress", function (e) {
+            if (e.key === 'Enter') sendMessage();
+        });
 
         function escapeHtml(str) {
             if (!str) return "";
@@ -262,12 +231,17 @@ const htmlContent = `<!DOCTYPE html>
 </body>
 </html>`;
 
-// --- ルーティング ---
 app.get("/", (c) => c.html(htmlContent));
+
+// 履歴取得APIをDurable Object側にルーティング
+app.get("/api/history", async (c) => {
+  const id = c.env.CHAT_ROOM.idFromName("default-room");
+  const stub = c.env.CHAT_ROOM.get(id);
+  return stub.fetch(c.req.raw);
+});
 
 app.get("/api/room/:id", async (c) => {
   const idParam = c.req.param("id");
-  // 固定のルームIDを使用
   const id = c.env.CHAT_ROOM.idFromName(idParam);
   const stub = c.env.CHAT_ROOM.get(id);
   return stub.fetch(c.req.raw);

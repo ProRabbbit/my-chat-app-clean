@@ -16,5 +16,12 @@
       "tag": "v1",
       "new_sqlite_classes": ["ChatRoom"]
     }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "chat-db",
+      "database_id": "8e96db07-b550-4957-978a-f125a04c9833"
+    }
   ]
 }
