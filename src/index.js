@@ -21,7 +21,6 @@ export class ChatRoom {
       const { results } = await this.env.DB.prepare(
         "SELECT * FROM messages ORDER BY id DESC LIMIT 50"
       ).all();
-      // 古い順に並べ替えて返す
       return Response.json(results.reverse());
     }
 
@@ -43,12 +42,10 @@ export class ChatRoom {
       const time = new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
       const messageData = { name: data.name, text: data.text, time: time };
 
-      // データベースにメッセージを保存
       await this.env.DB.prepare(
         "INSERT INTO messages (name, text, time) VALUES (?, ?, ?)"
       ).bind(messageData.name, messageData.text, messageData.time).run();
 
-      // 接続中の全員にブロードキャスト
       for (const socket of this.sessions) {
         socket.send(JSON.stringify(messageData));
       }
@@ -102,6 +99,32 @@ const htmlContent = `<!DOCTYPE html>
             z-index: 100;
         }
         header span { font-size: 0.875rem; color: #6b7280; font-weight: normal; }
+        
+        /* モーダル（名前入力画面） */
+        #name-modal {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+        .modal-content {
+            background: white;
+            padding: 2rem;
+            border-radius: 1rem;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            width: 90%;
+            max-width: 400px;
+            text-align: center;
+        }
+        .modal-content h2 { margin-bottom: 1rem; color: var(--text-color); }
+        .modal-content input {
+            width: 100%; padding: 0.75rem; border: 1px solid #d1d5db; border-radius: 0.5rem; margin-bottom: 1rem; font-size: 1rem; outline: none;
+        }
+        .modal-content button { width: 100%; padding: 0.75rem; }
+
         #chat-container {
             flex: 1;
             margin-top: var(--header-height);
@@ -151,6 +174,16 @@ const htmlContent = `<!DOCTYPE html>
     </style>
 </head>
 <body>
+
+    <!-- 名前入力モーダル -->
+    <div id="name-modal">
+        <div class="modal-content">
+            <h2>チャットに参加</h2>
+            <input type="text" id="username-input" placeholder="ユーザー名を入力..." autocomplete="off">
+            <button onclick="startChat()">参加する</button>
+        </div>
+    </div>
+
     <header>
         Chat App Lite
         <span id="my-name"></span>
@@ -162,13 +195,33 @@ const htmlContent = `<!DOCTYPE html>
     </div>
 
     <script>
-        const randomName = "ゲスト" + Math.floor(Math.random() * 9000 + 1000);
-        document.getElementById("my-name").innerText = "あなたの名前: " + randomName;
-
+        let myName = "";
         const chatContainer = document.getElementById("chat-container");
         const input = document.getElementById("message-input");
+        const usernameInput = document.getElementById("username-input");
+        const nameModal = document.getElementById("name-modal");
 
-        // 1. ページを開いたときに過去の履歴を読み込む
+        // モーダルで名前を決定してチャットを開始
+        function startChat() {
+            const name = usernameInput.value.trim();
+            if (!name) {
+                alert("ユーザー名を入力してください！");
+                return;
+            }
+            myName = name;
+            document.getElementById("my-name").innerText = "名前: " + myName;
+            nameModal.style.display = "none"; // モーダルを隠す
+
+            // 履歴を読み込み
+            loadHistory();
+            // WebSocket接続開始
+            connectWebSocket();
+        }
+
+        usernameInput.addEventListener("keypress", function (e) {
+            if (e.key === 'Enter') startChat();
+        });
+
         async function loadHistory() {
             try {
                 const res = await fetch('/api/history');
@@ -178,19 +231,20 @@ const htmlContent = `<!DOCTYPE html>
                 console.error("履歴の取得に失敗しました", e);
             }
         }
-        loadHistory();
 
-        // 2. WebSocketの接続
-        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const ws = new WebSocket(\`\${protocol}//\${window.location.host}/api/room/default-room\`);
+        let ws;
+        function connectWebSocket() {
+            const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+            ws = new WebSocket(\`\${protocol}//\${window.location.host}/api/room/default-room\`);
 
-        ws.onmessage = (event) => {
-            const data = JSON.parse(event.data);
-            appendMessage(data);
-        };
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                appendMessage(data);
+            };
+        }
 
         function appendMessage(data) {
-            const isMine = data.name === randomName;
+            const isMine = data.name === myName;
             const div = document.createElement("div");
             div.className = \`message \${isMine ? 'mine' : ''}\`;
 
@@ -206,10 +260,10 @@ const htmlContent = `<!DOCTYPE html>
 
         function sendMessage() {
             const text = input.value;
-            if (!text.trim()) return;
+            if (!text.trim() || !ws) return;
 
             const payload = {
-                name: randomName,
+                name: myName,
                 text: text
             };
             ws.send(JSON.stringify(payload));
@@ -233,7 +287,6 @@ const htmlContent = `<!DOCTYPE html>
 
 app.get("/", (c) => c.html(htmlContent));
 
-// 履歴取得APIをDurable Object側にルーティング
 app.get("/api/history", async (c) => {
   const id = c.env.CHAT_ROOM.idFromName("default-room");
   const stub = c.env.CHAT_ROOM.get(id);
