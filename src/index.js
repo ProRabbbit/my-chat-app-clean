@@ -1,4 +1,16 @@
 import { Hono } from 'hono';
+import webpush from 'web-push';
+
+// ★ ステップ1で生成したキーをここに設定してください
+const PUBLIC_VAPID_KEY = 'BO0DQ2U7QwDK2NR_WGyTGZ473YCXNGPb45kvTqp7qGmBVFfAmYwBkvU0G3-yWPuXw-m3ODpAImbU_QBKRmSgh0Q'; 
+// ※Private Keyはサーバー側の環境変数やコード内に保持します（今回は簡易的にコード内に記述します）
+const PRIVATE_VAPID_KEY = 'jlQYSawgWK0or9KNqJvr9ZCWb_HWfdIjnm3ROz0RPVM';
+
+webpush.setVapidDetails(
+  'mailto:example@yourdomain.com',
+  PUBLIC_VAPID_KEY,
+  PRIVATE_VAPID_KEY
+);
 
 const app = new Hono();
 
@@ -16,12 +28,22 @@ export class ChatRoom {
   async fetch(request) {
     const url = new URL(request.url);
 
-    // 過去の履歴を返すAPI
+    // 履歴取得
     if (url.pathname === "/api/history") {
       const { results } = await this.env.DB.prepare(
         "SELECT * FROM messages ORDER BY id DESC LIMIT 50"
       ).all();
       return Response.json(results.reverse());
+    }
+
+    // プッシュ通知の購読登録エンドポイント
+    if (url.pathname === "/api/subscribe" && request.method === "POST") {
+      const sub = await request.json();
+      // 既に同じendpointが登録されていなければ保存
+      await this.env.DB.prepare(
+        "INSERT INTO push_subscriptions (endpoint, p256dh, auth) VALUES (?, ?, ?)"
+      ).bind(sub.endpoint, sub.keys.p256dh, sub.keys.auth).run();
+      return Response.json({ success: true });
     }
 
     const upgradeHeader = request.headers.get("Upgrade");
@@ -42,12 +64,35 @@ export class ChatRoom {
       const time = new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
       const messageData = { name: data.name, text: data.text, time: time };
 
+      // DBにメッセージ保存
       await this.env.DB.prepare(
         "INSERT INTO messages (name, text, time) VALUES (?, ?, ?)"
       ).bind(messageData.name, messageData.text, messageData.time).run();
 
+      // 1. 開いているセッション（タブ）へリアルタイム送信
       for (const socket of this.sessions) {
         socket.send(JSON.stringify(messageData));
+      }
+
+      // 2. タブを閉じている人を含め、登録されている全端末へWeb Push通知を送信
+      const { results: subs } = await this.env.DB.prepare("SELECT * FROM push_subscriptions").all();
+      const payload = JSON.stringify({
+        title: `${messageData.name} さんからのメッセージ`,
+        body: messageData.text
+      });
+
+      for (const sub of subs) {
+        const pushSubscription = {
+          endpoint: sub.endpoint,
+          keys: {
+            p256dh: sub.p256dh,
+            auth: sub.auth
+          }
+        };
+        // バックグラウンド通知の送信（失敗した古い購読は無視）
+        webpush.sendNotification(pushSubscription, payload).catch(err => {
+          console.error("Push notification error:", err);
+        });
       }
     });
 
@@ -100,7 +145,6 @@ const htmlContent = `<!DOCTYPE html>
         }
         header span { font-size: 0.875rem; color: #6b7280; font-weight: normal; }
         
-        /* モーダル（名前入力画面） */
         #name-modal {
             position: fixed;
             top: 0; left: 0; width: 100%; height: 100%;
@@ -175,7 +219,6 @@ const htmlContent = `<!DOCTYPE html>
 </head>
 <body>
 
-    <!-- 名前入力モーダル -->
     <div id="name-modal">
         <div class="modal-content">
             <h2>チャットに参加</h2>
@@ -195,14 +238,14 @@ const htmlContent = `<!DOCTYPE html>
     </div>
 
     <script>
+        const PUBLIC_VAPID_KEY = '${PUBLIC_VAPID_KEY}';
         let myName = "";
         const chatContainer = document.getElementById("chat-container");
         const input = document.getElementById("message-input");
         const usernameInput = document.getElementById("username-input");
         const nameModal = document.getElementById("name-modal");
 
-        // モーダルで名前を決定してチャットを開始
-        function startChat() {
+        async function startChat() {
             const name = usernameInput.value.trim();
             if (!name) {
                 alert("ユーザー名を入力してください！");
@@ -210,12 +253,41 @@ const htmlContent = `<!DOCTYPE html>
             }
             myName = name;
             document.getElementById("my-name").innerText = "名前: " + myName;
-            nameModal.style.display = "none"; // モーダルを隠す
+            nameModal.style.display = "none";
 
-            // 履歴を読み込み
+            // Service Worker の登録とプッシュ通知の購読設定
+            if ('serviceWorker' in navigator && 'PushManager' in window) {
+                try {
+                    const reg = await navigator.serviceWorker.register('/sw.js');
+                    const subscription = await reg.pushManager.subscribe({
+                        userVisibleOnly: true,
+                        applicationServerKey: urlBase64ToUint8Array(PUBLIC_VAPID_KEY)
+                    });
+
+                    // サーバーへ購読情報を送信
+                    await fetch('/api/subscribe', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(subscription)
+                    });
+                } catch (e) {
+                    console.error("Push subscription failed:", e);
+                }
+            }
+
             loadHistory();
-            // WebSocket接続開始
             connectWebSocket();
+        }
+
+        function urlBase64ToUint8Array(base64String) {
+            const padding = '='.repeat((4 - base64String.length % 4) % 4);
+            const base64 = (base64String + padding).replace(/\\-/g, '+').replace(/_/g, '/');
+            const rawData = window.atob(base64);
+            const outputArray = new Uint8Array(rawData.length);
+            for (let i = 0; i < rawData.length; ++i) {
+                outputArray[i] = rawData.charCodeAt(0);
+            }
+            return outputArray;
         }
 
         usernameInput.addEventListener("keypress", function (e) {
@@ -287,7 +359,14 @@ const htmlContent = `<!DOCTYPE html>
 
 app.get("/", (c) => c.html(htmlContent));
 
+// Durable Objectへのルーティング
 app.get("/api/history", async (c) => {
+  const id = c.env.CHAT_ROOM.idFromName("default-room");
+  const stub = c.env.CHAT_ROOM.get(id);
+  return stub.fetch(c.req.raw);
+});
+
+app.post("/api/subscribe", async (c) => {
   const id = c.env.CHAT_ROOM.idFromName("default-room");
   const stub = c.env.CHAT_ROOM.get(id);
   return stub.fetch(c.req.raw);
