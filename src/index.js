@@ -1,17 +1,6 @@
 import { Hono } from 'hono';
 import webpush from 'web-push';
 
-// ★ ステップ1で生成したキーをここに設定してください
-const PUBLIC_VAPID_KEY = 'BO0DQ2U7QwDK2NR_WGyTGZ473YCXNGPb45kvTqp7qGmBVFfAmYwBkvU0G3-yWPuXw-m3ODpAImbU_QBKRmSgh0Q'; 
-// ※Private Keyはサーバー側の環境変数やコード内に保持します（今回は簡易的にコード内に記述します）
-const PRIVATE_VAPID_KEY = 'jlQYSawgWK0or9KNqJvr9ZCWb_HWfdIjnm3ROz0RPVM';
-
-webpush.setVapidDetails(
-  'mailto:example@yourdomain.com',
-  PUBLIC_VAPID_KEY,
-  PRIVATE_VAPID_KEY
-);
-
 const app = new Hono();
 
 // --- バックエンド (Durable Object) ---
@@ -39,9 +28,10 @@ export class ChatRoom {
     // プッシュ通知の購読登録エンドポイント
     if (url.pathname === "/api/subscribe" && request.method === "POST") {
       const sub = await request.json();
-      // 既に同じendpointが登録されていなければ保存
+      // UNIQUE(endpoint) 制約により、既存の場合はp256dh/authを更新するだけにする
       await this.env.DB.prepare(
-        "INSERT INTO push_subscriptions (endpoint, p256dh, auth) VALUES (?, ?, ?)"
+        "INSERT INTO push_subscriptions (endpoint, p256dh, auth) VALUES (?, ?, ?) " +
+        "ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth"
       ).bind(sub.endpoint, sub.keys.p256dh, sub.keys.auth).run();
       return Response.json({ success: true });
     }
@@ -58,7 +48,7 @@ export class ChatRoom {
   handleSession(websocket) {
     websocket.accept();
     this.sessions.add(websocket);
-    
+
     websocket.addEventListener("message", async (event) => {
       const data = JSON.parse(event.data);
       const time = new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
@@ -74,7 +64,14 @@ export class ChatRoom {
         socket.send(JSON.stringify(messageData));
       }
 
-      /// 2. タブを閉じている人を含め、登録されている全端末へWeb Push通知を送信
+      // 2. タブを閉じている人を含め、登録されている全端末へWeb Push通知を送信
+      //    VAPIDキーはDurable Object内でenv経由（wrangler secret）から都度セットする
+      webpush.setVapidDetails(
+        'mailto:example@yourdomain.com', // ← 実在するメールアドレスに変更してください
+        this.env.VAPID_PUBLIC_KEY,
+        this.env.VAPID_PRIVATE_KEY
+      );
+
       const { results: subs } = await this.env.DB.prepare("SELECT * FROM push_subscriptions").all();
       const payload = JSON.stringify({
         title: `${messageData.name} さんからのメッセージ`,
@@ -89,12 +86,18 @@ export class ChatRoom {
             auth: sub.auth
           }
         };
-        
-        // ★ エラーの詳細をしっかりコンソールに出すように書き換え
+
         try {
           await webpush.sendNotification(pushSubscription, payload);
         } catch (err) {
-          console.error("Push notification error detail:", err.statusCode, err.body || err.message);
+          console.error("Push notification error:", err.statusCode, err.body || err.message);
+
+          // 失効した購読（404/410）はDBから削除してゴミを残さない
+          if (err.statusCode === 404 || err.statusCode === 410) {
+            await this.env.DB.prepare(
+              "DELETE FROM push_subscriptions WHERE endpoint = ?"
+            ).bind(sub.endpoint).run();
+          }
         }
       }
     });
@@ -106,7 +109,9 @@ export class ChatRoom {
 }
 
 // --- フロントエンド (HTML/CSS) ---
-const htmlContent = `<!DOCTYPE html>
+// PUBLIC_VAPID_KEY はクライアントに埋め込むだけなので secret ではなく通常の env var (vars) でOK
+function renderHtml(publicVapidKey) {
+  return `<!DOCTYPE html>
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
@@ -147,7 +152,7 @@ const htmlContent = `<!DOCTYPE html>
             z-index: 100;
         }
         header span { font-size: 0.875rem; color: #6b7280; font-weight: normal; }
-        
+
         #name-modal {
             position: fixed;
             top: 0; left: 0; width: 100%; height: 100%;
@@ -234,14 +239,18 @@ const htmlContent = `<!DOCTYPE html>
         Chat App Lite
         <span id="my-name"></span>
     </header>
-    <div id="chat-container"></div>
+    <div id="chat-container">
+        <div style="text-align:right; padding-bottom: 4px;">
+            <button id="refresh-btn" onclick="loadHistory()" style="padding: 5px 10px; font-size: 0.8rem;">更新</button>
+        </div>
+    </div>
     <div id="input-area">
         <input type="text" id="message-input" placeholder="メッセージを入力..." autocomplete="off">
         <button onclick="sendMessage()">送信</button>
     </div>
 
     <script>
-        const PUBLIC_VAPID_KEY = '${PUBLIC_VAPID_KEY}';
+        const PUBLIC_VAPID_KEY = '${publicVapidKey}';
         let myName = "";
         const chatContainer = document.getElementById("chat-container");
         const input = document.getElementById("message-input");
@@ -258,7 +267,7 @@ const htmlContent = `<!DOCTYPE html>
             document.getElementById("my-name").innerText = "名前: " + myName;
             nameModal.style.display = "none";
 
-            // ★ ここで明示的にブラウザに通知の許可を求めるポップアップを出させる
+            // 明示的にブラウザに通知の許可を求めるポップアップを出させる
             if ("Notification" in window) {
                 const permission = await Notification.requestPermission();
                 if (permission !== "granted") {
@@ -270,6 +279,13 @@ const htmlContent = `<!DOCTYPE html>
             if ('serviceWorker' in navigator && 'PushManager' in window) {
                 try {
                     const reg = await navigator.serviceWorker.register('/sw.js');
+
+                    // 古い（壊れた鍵などで登録済みの）購読があれば一度破棄してから再購読する
+                    const existing = await reg.pushManager.getSubscription();
+                    if (existing) {
+                        await existing.unsubscribe();
+                    }
+
                     const subscription = await reg.pushManager.subscribe({
                         userVisibleOnly: true,
                         applicationServerKey: urlBase64ToUint8Array(PUBLIC_VAPID_KEY)
@@ -296,7 +312,7 @@ const htmlContent = `<!DOCTYPE html>
             const rawData = window.atob(base64);
             const outputArray = new Uint8Array(rawData.length);
             for (let i = 0; i < rawData.length; ++i) {
-                outputArray[i] = rawData.charCodeAt(0);
+                outputArray[i] = rawData.charCodeAt(i);
             }
             return outputArray;
         }
@@ -308,10 +324,12 @@ const htmlContent = `<!DOCTYPE html>
         async function loadHistory() {
             try {
                 const res = await fetch('/api/history');
-                const history = await res.json();
-                history.forEach(data => appendMessage(data));
+                const messages = await res.json();
+                // 既存メッセージ表示をクリア（更新ボタン行は残す）
+                document.querySelectorAll('.message').forEach(el => el.remove());
+                messages.forEach(appendMessage);
             } catch (e) {
-                console.error("履歴の取得に失敗しました", e);
+                console.error("Failed to load history:", e);
             }
         }
 
@@ -367,8 +385,9 @@ const htmlContent = `<!DOCTYPE html>
     </script>
 </body>
 </html>`;
+}
 
-app.get("/", (c) => c.html(htmlContent));
+app.get("/", (c) => c.html(renderHtml(c.env.VAPID_PUBLIC_KEY)));
 
 // Durable Objectへのルーティング
 app.get("/api/history", async (c) => {
